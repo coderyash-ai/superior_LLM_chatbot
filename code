@@ -1,0 +1,531 @@
+import gradio as gr
+import requests
+import os
+from datetime import datetime
+from functools import lru_cache
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import ast
+import time
+import logging
+from time import sleep
+import re
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Hugging Face API setup
+HF_API_TOKEN = os.getenv("HF_API_TOKEN", "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")
+MODEL_MAP = {
+    "StarCoder": "https://api-inference.huggingface.co/models/bigcode/starcoder",
+    "CodeLLaMA": "https://api-inference.huggingface.co/models/codellama/CodeLlama-13b-hf"
+}
+
+# Local model setup
+LOCAL_MODEL = "bigcode/starcoder"
+tokenizer = None
+model = None
+try:
+    if os.path.exists("./local_model"):
+        tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL, local_files_only=True)
+        model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL, local_files_only=True)
+        logger.info("Local model loaded successfully")
+except Exception as e:
+    logger.error(f"Failed to load local model: {e}")
+
+# Global state
+history = []
+last_output = {"text": "", "action": "Generate", "lang": "Python"}
+codebase_context = ""
+last_suggestion_time = 0
+MAX_INPUT_TOKENS = 4000
+MAX_NEW_TOKENS = 512
+
+def count_tokens(text):
+    """Estimate token count if tokenizer is available, otherwise approximate"""
+    if tokenizer:
+        return len(tokenizer.encode(text))
+    return len(text) // 4 + 1
+
+def truncate_input(text, max_tokens=MAX_INPUT_TOKENS):
+    """Truncate input text to fit within token limits"""
+    if count_tokens(text) <= max_tokens:
+        return text
+    if tokenizer:
+        tokens = tokenizer.encode(text)[:max_tokens]
+        return tokenizer.decode(tokens, skip_special_tokens=True)
+    return text[:max_tokens * 4]
+
+def is_mostly_english(text):
+    """Basic check to detect if text is mostly English (ASCII-based)"""
+    ascii_chars = re.sub(r'[^ -~]', '', text)  # Remove non-ASCII characters
+    return len(ascii_chars) / len(text) > 0.8 if text else True
+
+@lru_cache(maxsize=128)
+def get_hf_response(input_code, action, language, model_choice="StarCoder"):
+    """Integrate Hugging Face API or local model with retry, fallback, and English enforcement"""
+    truncated_input = truncate_input(input_code)
+    if truncated_input != input_code:
+        logger.warning("Input truncated due to token limit")
+
+    if model_choice == "Offline" and model and tokenizer:
+        try:
+            inputs = tokenizer(truncated_input, return_tensors="pt")
+            outputs = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS)
+            return tokenizer.decode(outputs[0], skip_special_tokens=True)
+        except Exception as e:
+            return f"Local model error: {str(e)}"
+
+    api_url = MODEL_MAP.get(model_choice, MODEL_MAP["StarCoder"])
+    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+    prompt_map = {
+        "Generate": f"Generate {language} code for: {truncated_input}\nContext: {truncate_input(codebase_context)}",
+        "Explain": f"/* Explain this {language} code in English: {truncated_input} */",
+        "Debug": f"/* Debug this {language} code and explain fixes in English: {truncated_input} */",
+        "Test": f"Generate unit tests for this {language} code: {truncated_input}",
+        "Refactor": f"Refactor this {language} code for better performance and explain changes in English: {truncated_input}"
+    }
+
+    payload = {
+        "inputs": prompt_map[action],
+        "parameters": {"max_new_tokens": MAX_NEW_TOKENS, "temperature": 0.7, "return_full_text": False}
+    }
+
+    total_tokens = count_tokens(payload["inputs"]) + MAX_NEW_TOKENS
+    if total_tokens > 8192:
+        return f"Error: Input ({count_tokens(payload['inputs'])} tokens) + output ({MAX_NEW_TOKENS} tokens) exceeds 8192 token limit"
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(api_url, headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            result = data[0]["generated_text"] if isinstance(data, list) and "generated_text" in data[0] else "API response malformed"
+            logger.info(f"Raw API response: {result[:100]}...")  # Log first 100 chars for debugging
+            if action in ["Explain", "Debug", "Refactor"] and not is_mostly_english(result):
+                logger.warning("Non-English output detected, retrying with stronger prompt")
+                payload["inputs"] = f"/* {prompt_map[action]} - Output must be in English */"
+                continue
+            return result
+        except requests.RequestException as e:
+            if attempt < max_retries - 1:
+                sleep(2 ** attempt)
+                logger.warning(f"API attempt {attempt + 1} failed: {str(e)}. Retrying...")
+                continue
+            if model and tokenizer:
+                logger.info("API failed after retries, falling back to local model")
+                try:
+                    inputs = tokenizer(truncated_input, return_tensors="pt")
+                    outputs = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS)
+                    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+                except Exception as e:
+                    return f"Local model fallback error: {str(e)}"
+            return f"API Error after {max_retries} attempts: {str(e)}"
+
+@lru_cache(maxsize=128)
+def get_suggestions(input_code, language):
+    """Cached real-time suggestions with rate limiting and token handling"""
+    global last_suggestion_time
+    current_time = time.time()
+    if current_time - last_suggestion_time < 0.5:
+        return "Typing too fast, suggestions paused..."
+    last_suggestion_time = current_time
+
+    if len(input_code.strip()) < 5:
+        return "Start typing to get suggestions..."
+    truncated_input = truncate_input(input_code)
+    return get_hf_response(truncated_input, "Generate", language, "StarCoder")[:100]
+
+def analyze_complexity(code, language):
+    """Basic complexity analysis"""
+    if language == "Python":
+        try:
+            tree = ast.parse(code)
+            loops = sum(1 for node in ast.walk(tree) if isinstance(node, (ast.For, ast.While)))
+            return f"Estimated Time Complexity: O(n^{loops})" if loops else "O(1)"
+        except SyntaxError:
+            return "Syntax error in code"
+        except Exception:
+            return "Complexity analysis failed"
+    return "Complexity analysis not supported for this language"
+
+def create_superior_app():
+    css = """
+    .dark-theme {background-color: #1e1e1e; color: #ffffff; font-family: Arial;}
+    .code-box {background-color: #2d2d2d; font-family: monospace; color: #ffffff; border-radius: 5px;}
+    .suggestion-box {background-color: #333333; color: #00ff00; font-size: 12px; font-family: monospace;}
+    .button {background-color: #4a4a4a !important; color: #ffffff !important; border-radius: 5px;}
+    .output-box pre {margin: 0; padding: 10px; background: #2d2d2d;}
+    body {background-color: #1e1e1e !important;}
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-okaidia.min.css" rel="stylesheet" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js"></script>
+    """
+
+    with gr.Blocks(title="Superior Code Assistant", css=css) as app:
+        gr.Markdown("# Superior Code Assistant\nWith Advanced Features")
+
+        with gr.Tabs():
+            with gr.Tab("Code Editor"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        language_selector = gr.Dropdown(choices=["Python", "JavaScript", "C++"], label="Language", value="Python")
+                        model_selector = gr.Dropdown(choices=["StarCoder", "CodeLLaMA", "Offline"], label="AI Model", value="StarCoder")
+                        codebase_upload = gr.File(label="Upload Codebase for Context", file_count="multiple")
+                        code_input = gr.Textbox(lines=15, placeholder="Enter your code here...", label="Code Editor", elem_classes="code-box")
+                        suggestions = gr.Textbox(lines=3, label="Real-Time Suggestions", interactive=False, elem_classes="suggestion-box")
+                        chat_input = gr.Textbox(lines=2, placeholder="Ask about your code...", label="Code Chat")
+                        with gr.Row():
+                            generate_btn = gr.Button("Generate Code")
+                            explain_btn = gr.Button("Explain Code")
+                            debug_btn = gr.Button("Debug Code")
+                            test_btn = gr.Button("Generate Tests")
+                            refactor_btn = gr.Button("Refactor Code")
+
+                    with gr.Column(scale=1):
+                        output = gr.HTML(label="Output", value="<pre>No output yet</pre>")
+                        complexity = gr.Textbox(label="Complexity Analysis", interactive=False)
+                        chat_output = gr.Textbox(lines=5, label="Chat Response", interactive=False)
+                        download_btn = gr.Button("Download Output")
+
+                def update_context(files):
+                    global codebase_context
+                    if not files:
+                        return "No files uploaded"
+                    try:
+                        codebase_context = "\n".join(
+                            [f.read().decode('utf-8', errors='ignore') if hasattr(f, 'read') else f for f in (files if isinstance(files, list) else [files])]
+                        )
+                        if count_tokens(codebase_context) > MAX_INPUT_TOKENS:
+                            codebase_context = truncate_input(codebase_context)
+                            return "Codebase context updated (truncated due to token limit)"
+                        return "Codebase context updated"
+                    except Exception as e:
+                        return f"Error processing files: {str(e)}"
+
+                codebase_upload.upload(fn=update_context, inputs=codebase_upload, outputs=suggestions)
+
+                code_input.change(fn=get_suggestions, inputs=[code_input, language_selector], outputs=suggestions)
+
+                def process_action(code, action, lang, model):
+                    if not code.strip():
+                        return "<pre>No input provided</pre>", "N/A", ""
+                    try:
+                        result = get_hf_response(code, action, lang, model)
+                        last_output.update({"text": result, "action": action, "lang": lang})
+                        history.append(f"[{action} - {lang}] Input: {code[:50]}... | Output: {result[:50]}...")
+                        prism_lang = "cpp" if lang.lower() == "c++" else lang.lower()
+                        complexity_result = analyze_complexity(code, lang) if action in ["Generate", "Refactor"] else "N/A"
+                        return f'<pre><code class="language-{prism_lang}">{result}</code></pre>', complexity_result, ""
+                    except Exception as e:
+                        return f"<pre>Error: {str(e)}</pre>", "N/A", ""
+
+                def chat_with_code(code, query, lang):
+                    if not query:
+                        return "Ask a question!"
+                    return get_hf_response(f"{code}\n\nQuestion: {query}", "Explain", lang)
+
+                for btn, action in [
+                    (generate_btn, "Generate"), (explain_btn, "Explain"), (debug_btn, "Debug"),
+                    (test_btn, "Test"), (refactor_btn, "Refactor")
+                ]:
+                    btn.click(
+                        fn=process_action,
+                        inputs=[code_input, gr.State(value=action), language_selector, model_selector],
+                        outputs=[output, complexity, chat_output]
+                    )
+
+                chat_input.submit(fn=chat_with_code, inputs=[code_input, chat_input, language_selector], outputs=chat_output)
+
+                def download_output():
+                    if not last_output["text"]:
+                        return None
+                    try:
+                        filename = f"output_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                        with open(filename, "w", encoding="utf-8") as f:
+                            f.write(last_output["text"])
+                        return gr.File(value=filename)
+                    except Exception as e:
+                        logger.error(f"Download failed: {e}")
+                        return None
+
+                download_btn.click(fn=download_output, inputs=None, outputs=gr.File(label="Download Output"))
+
+            with gr.Tab("History"):
+                history_output = gr.Textbox(lines=15, label="Interaction History", value="\n".join(history), interactive=False, elem_classes="code-box")
+                for btn in [generate_btn, explain_btn, debug_btn, test_btn, refactor_btn]:
+                    btn.click(fn=lambda: "\n".join(history), inputs=None, outputs=history_output)
+
+    return app
+
+if __name__ == "__main__":
+    app = create_superior_app()
+    app.launch()import gradio as gr
+import requests
+import os
+from datetime import datetime
+from functools import lru_cache
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import ast
+import time
+import logging
+from time import sleep
+import re
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Hugging Face API setup
+HF_API_TOKEN = os.getenv("HF_API_TOKEN", "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")
+MODEL_MAP = {
+    "StarCoder": "https://api-inference.huggingface.co/models/bigcode/starcoder",
+    "CodeLLaMA": "https://api-inference.huggingface.co/models/codellama/CodeLlama-13b-hf"
+}
+
+# Local model setup
+LOCAL_MODEL = "bigcode/starcoder"
+tokenizer = None
+model = None
+try:
+    if os.path.exists("./local_model"):
+        tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL, local_files_only=True)
+        model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL, local_files_only=True)
+        logger.info("Local model loaded successfully")
+except Exception as e:
+    logger.error(f"Failed to load local model: {e}")
+
+# Global state
+history = []
+last_output = {"text": "", "action": "Generate", "lang": "Python"}
+codebase_context = ""
+last_suggestion_time = 0
+MAX_INPUT_TOKENS = 4000
+MAX_NEW_TOKENS = 512
+
+def count_tokens(text):
+    """Estimate token count if tokenizer is available, otherwise approximate"""
+    if tokenizer:
+        return len(tokenizer.encode(text))
+    return len(text) // 4 + 1
+
+def truncate_input(text, max_tokens=MAX_INPUT_TOKENS):
+    """Truncate input text to fit within token limits"""
+    if count_tokens(text) <= max_tokens:
+        return text
+    if tokenizer:
+        tokens = tokenizer.encode(text)[:max_tokens]
+        return tokenizer.decode(tokens, skip_special_tokens=True)
+    return text[:max_tokens * 4]
+
+def is_mostly_english(text):
+    """Basic check to detect if text is mostly English (ASCII-based)"""
+    ascii_chars = re.sub(r'[^ -~]', '', text)  # Remove non-ASCII characters
+    return len(ascii_chars) / len(text) > 0.8 if text else True
+
+@lru_cache(maxsize=128)
+def get_hf_response(input_code, action, language, model_choice="StarCoder"):
+    """Integrate Hugging Face API or local model with retry, fallback, and English enforcement"""
+    truncated_input = truncate_input(input_code)
+    if truncated_input != input_code:
+        logger.warning("Input truncated due to token limit")
+
+    if model_choice == "Offline" and model and tokenizer:
+        try:
+            inputs = tokenizer(truncated_input, return_tensors="pt")
+            outputs = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS)
+            return tokenizer.decode(outputs[0], skip_special_tokens=True)
+        except Exception as e:
+            return f"Local model error: {str(e)}"
+
+    api_url = MODEL_MAP.get(model_choice, MODEL_MAP["StarCoder"])
+    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+    prompt_map = {
+        "Generate": f"Generate {language} code for: {truncated_input}\nContext: {truncate_input(codebase_context)}",
+        "Explain": f"/* Explain this {language} code in English: {truncated_input} */",
+        "Debug": f"/* Debug this {language} code and explain fixes in English: {truncated_input} */",
+        "Test": f"Generate unit tests for this {language} code: {truncated_input}",
+        "Refactor": f"Refactor this {language} code for better performance and explain changes in English: {truncated_input}"
+    }
+
+    payload = {
+        "inputs": prompt_map[action],
+        "parameters": {"max_new_tokens": MAX_NEW_TOKENS, "temperature": 0.7, "return_full_text": False}
+    }
+
+    total_tokens = count_tokens(payload["inputs"]) + MAX_NEW_TOKENS
+    if total_tokens > 8192:
+        return f"Error: Input ({count_tokens(payload['inputs'])} tokens) + output ({MAX_NEW_TOKENS} tokens) exceeds 8192 token limit"
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(api_url, headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            result = data[0]["generated_text"] if isinstance(data, list) and "generated_text" in data[0] else "API response malformed"
+            logger.info(f"Raw API response: {result[:100]}...")  # Log first 100 chars for debugging
+            if action in ["Explain", "Debug", "Refactor"] and not is_mostly_english(result):
+                logger.warning("Non-English output detected, retrying with stronger prompt")
+                payload["inputs"] = f"/* {prompt_map[action]} - Output must be in English */"
+                continue
+            return result
+        except requests.RequestException as e:
+            if attempt < max_retries - 1:
+                sleep(2 ** attempt)
+                logger.warning(f"API attempt {attempt + 1} failed: {str(e)}. Retrying...")
+                continue
+            if model and tokenizer:
+                logger.info("API failed after retries, falling back to local model")
+                try:
+                    inputs = tokenizer(truncated_input, return_tensors="pt")
+                    outputs = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS)
+                    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+                except Exception as e:
+                    return f"Local model fallback error: {str(e)}"
+            return f"API Error after {max_retries} attempts: {str(e)}"
+
+@lru_cache(maxsize=128)
+def get_suggestions(input_code, language):
+    """Cached real-time suggestions with rate limiting and token handling"""
+    global last_suggestion_time
+    current_time = time.time()
+    if current_time - last_suggestion_time < 0.5:
+        return "Typing too fast, suggestions paused..."
+    last_suggestion_time = current_time
+
+    if len(input_code.strip()) < 5:
+        return "Start typing to get suggestions..."
+    truncated_input = truncate_input(input_code)
+    return get_hf_response(truncated_input, "Generate", language, "StarCoder")[:100]
+
+def analyze_complexity(code, language):
+    """Basic complexity analysis"""
+    if language == "Python":
+        try:
+            tree = ast.parse(code)
+            loops = sum(1 for node in ast.walk(tree) if isinstance(node, (ast.For, ast.While)))
+            return f"Estimated Time Complexity: O(n^{loops})" if loops else "O(1)"
+        except SyntaxError:
+            return "Syntax error in code"
+        except Exception:
+            return "Complexity analysis failed"
+    return "Complexity analysis not supported for this language"
+
+def create_superior_app():
+    css = """
+    .dark-theme {background-color: #1e1e1e; color: #ffffff; font-family: Arial;}
+    .code-box {background-color: #2d2d2d; font-family: monospace; color: #ffffff; border-radius: 5px;}
+    .suggestion-box {background-color: #333333; color: #00ff00; font-size: 12px; font-family: monospace;}
+    .button {background-color: #4a4a4a !important; color: #ffffff !important; border-radius: 5px;}
+    .output-box pre {margin: 0; padding: 10px; background: #2d2d2d;}
+    body {background-color: #1e1e1e !important;}
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-okaidia.min.css" rel="stylesheet" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js"></script>
+    """
+
+    with gr.Blocks(title="Superior Code Assistant", css=css) as app:
+        gr.Markdown("# Superior Code Assistant\nWith Advanced Features")
+
+        with gr.Tabs():
+            with gr.Tab("Code Editor"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        language_selector = gr.Dropdown(choices=["Python", "JavaScript", "C++"], label="Language", value="Python")
+                        model_selector = gr.Dropdown(choices=["StarCoder", "CodeLLaMA", "Offline"], label="AI Model", value="StarCoder")
+                        codebase_upload = gr.File(label="Upload Codebase for Context", file_count="multiple")
+                        code_input = gr.Textbox(lines=15, placeholder="Enter your code here...", label="Code Editor", elem_classes="code-box")
+                        suggestions = gr.Textbox(lines=3, label="Real-Time Suggestions", interactive=False, elem_classes="suggestion-box")
+                        chat_input = gr.Textbox(lines=2, placeholder="Ask about your code...", label="Code Chat")
+                        with gr.Row():
+                            generate_btn = gr.Button("Generate Code")
+                            explain_btn = gr.Button("Explain Code")
+                            debug_btn = gr.Button("Debug Code")
+                            test_btn = gr.Button("Generate Tests")
+                            refactor_btn = gr.Button("Refactor Code")
+
+                    with gr.Column(scale=1):
+                        output = gr.HTML(label="Output", value="<pre>No output yet</pre>")
+                        complexity = gr.Textbox(label="Complexity Analysis", interactive=False)
+                        chat_output = gr.Textbox(lines=5, label="Chat Response", interactive=False)
+                        download_btn = gr.Button("Download Output")
+
+                def update_context(files):
+                    global codebase_context
+                    if not files:
+                        return "No files uploaded"
+                    try:
+                        codebase_context = "\n".join(
+                            [f.read().decode('utf-8', errors='ignore') if hasattr(f, 'read') else f for f in (files if isinstance(files, list) else [files])]
+                        )
+                        if count_tokens(codebase_context) > MAX_INPUT_TOKENS:
+                            codebase_context = truncate_input(codebase_context)
+                            return "Codebase context updated (truncated due to token limit)"
+                        return "Codebase context updated"
+                    except Exception as e:
+                        return f"Error processing files: {str(e)}"
+
+                codebase_upload.upload(fn=update_context, inputs=codebase_upload, outputs=suggestions)
+
+                code_input.change(fn=get_suggestions, inputs=[code_input, language_selector], outputs=suggestions)
+
+                def process_action(code, action, lang, model):
+                    if not code.strip():
+                        return "<pre>No input provided</pre>", "N/A", ""
+                    try:
+                        result = get_hf_response(code, action, lang, model)
+                        last_output.update({"text": result, "action": action, "lang": lang})
+                        history.append(f"[{action} - {lang}] Input: {code[:50]}... | Output: {result[:50]}...")
+                        prism_lang = "cpp" if lang.lower() == "c++" else lang.lower()
+                        complexity_result = analyze_complexity(code, lang) if action in ["Generate", "Refactor"] else "N/A"
+                        return f'<pre><code class="language-{prism_lang}">{result}</code></pre>', complexity_result, ""
+                    except Exception as e:
+                        return f"<pre>Error: {str(e)}</pre>", "N/A", ""
+
+                def chat_with_code(code, query, lang):
+                    if not query:
+                        return "Ask a question!"
+                    return get_hf_response(f"{code}\n\nQuestion: {query}", "Explain", lang)
+
+                for btn, action in [
+                    (generate_btn, "Generate"), (explain_btn, "Explain"), (debug_btn, "Debug"),
+                    (test_btn, "Test"), (refactor_btn, "Refactor")
+                ]:
+                    btn.click(
+                        fn=process_action,
+                        inputs=[code_input, gr.State(value=action), language_selector, model_selector],
+                        outputs=[output, complexity, chat_output]
+                    )
+
+                chat_input.submit(fn=chat_with_code, inputs=[code_input, chat_input, language_selector], outputs=chat_output)
+
+                def download_output():
+                    if not last_output["text"]:
+                        return None
+                    try:
+                        filename = f"output_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                        with open(filename, "w", encoding="utf-8") as f:
+                            f.write(last_output["text"])
+                        return gr.File(value=filename)
+                    except Exception as e:
+                        logger.error(f"Download failed: {e}")
+                        return None
+
+                download_btn.click(fn=download_output, inputs=None, outputs=gr.File(label="Download Output"))
+
+            with gr.Tab("History"):
+                history_output = gr.Textbox(lines=15, label="Interaction History", value="\n".join(history), interactive=False, elem_classes="code-box")
+                for btn in [generate_btn, explain_btn, debug_btn, test_btn, refactor_btn]:
+                    btn.click(fn=lambda: "\n".join(history), inputs=None, outputs=history_output)
+
+    return app
+
+if __name__ == "__main__":
+    app = create_superior_app()
+    app.launch()
