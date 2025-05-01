@@ -1,1 +1,132 @@
+# Superior Code Assistant 🚀
+
+**Superior Code Assistant** is an AI-powered tool designed to help developers with tasks like generating, debugging, and improving code. It uses machine learning models such as **StarCoder** and **CodeLLaMA** to make coding faster and easier. 💻🤖
+
+## Features 🌟
+
+- **Code Editor** ✍️: Write and edit code with syntax highlighting for multiple languages like Python, JavaScript, and C++.
+- **AI Assistance** 🤖: Get help from AI models for generating code, explaining code, debugging, and generating unit tests.
+- **Code Complexity Analysis** 📊: Analyze the complexity of your code to improve performance.
+- **Real-Time Suggestions** 💡: Receive suggestions for improvements as you write code.
+- **Interactive Chat** 💬: Ask the AI questions about your code to get detailed explanations.
+- **Code Refactoring** 🔧: Get improved, more efficient versions of your code.
+- **Downloadable Output** 📥: Download generated code or explanations in `.txt` format.
+- **History Tracking** 🕒: Keep track of your past interactions with the AI.
+
+## Requirements 🛠️
+
+Before running the app, make sure you have:
+
+- Python 3.7 or higher installed. 🐍
+- The `pip` package manager. 📦
+- An API token from **Hugging Face** (if using cloud models). 🌐
+
+### Install Dependencies 🔧
+
+Run the following command to install the necessary packages:
+
+```bash
+pip install -r requirements.txt
+```
+
+### Set Up API Token 🏷️
+
+To use the AI models from Hugging Face, you'll need to set an API token. Create a Hugging Face account, get your token, and set it as an environment variable like this:
+
+```bash
+export HF_API_TOKEN="your-hugging-face-token"
+```
+
+### Local Model Setup (Optional) 💾
+
+If you prefer to run the app without using cloud-based models, you can download the **StarCoder** and **CodeLLaMA** models and place them in the `./local_model` folder.
+
+## Running the Application 🚀
+
+Once you've set up the dependencies and environment variables, you can start the app by running this command:
+
+```bash
+python app.py
+```
+
+The app will be available at `http://localhost:7860` in your web browser. 🌍
+
+## How to Use the App ⚙️
+
+### 1. Code Editor ✍️
+   - Choose a programming language (Python, JavaScript, C++).
+   - Type or paste your code into the editor.
+   - The AI will suggest improvements or completions as you type.
+
+### 2. Generate Code 🛠️
+   - Click the **Generate Code** button to have the AI write the code you need.
+
+### 3. Explain Code 📖
+   - Highlight a section of code and click **Explain Code** to get a simple explanation of what it does.
+
+### 4. Debug Code 🐞
+   - Click the **Debug Code** button to find errors or issues and get suggestions on how to fix them.
+
+### 5. Generate Unit Tests 🧪
+   - Use the **Generate Tests** button to automatically create unit tests for your code.
+
+### 6. Refactor Code 🔧
+   - Click **Refactor Code** to get a cleaner and more efficient version of your code.
+
+### 7. Real-Time Suggestions 💡
+   - As you type, the AI will provide suggestions to improve or complete your code.
+
+### 8. Chat with the Assistant 💬
+   - You can ask the AI questions, such as "What does this function do?" or "How can I optimize this loop?" and get helpful responses.
+
+### 9. Download Output 📥
+   - After generating or improving code, you can download it in a `.txt` file by clicking **Download Output**.
+
+### 10. History 🕒
+   - You can view your past interactions with the app in the **History** tab.
+
+## How It Works 🤖
+
+The app uses AI models like **StarCoder** and **CodeLLaMA** to generate, debug, and refactor code. These models can be used in two ways:
+
+- **Cloud Mode** 🌐: The app will use cloud-based models if you provide a Hugging Face API token.
+- **Local Mode** 💾: If you download the models, the app will use them locally on your computer.
+
+## Contributing 💡
+
+If you want to contribute to the project:
+
+1. Fork the repository. 🍴
+2. Create a new branch:
+
+   ```bash
+   git checkout -b your-feature
+   ```
+
+3. Make your changes and commit them:
+
+   ```bash
+   git commit -am 'Add new feature'
+   ```
+
+4. Push your changes:
+
+   ```bash
+   git push origin your-feature
+   ```
+
+5. Open a pull request to the main repository. 🚀
+
+## License 📄
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for more details.
+
+## Acknowledgments 🙏
+
+- Thanks to **Hugging Face** for providing the AI models. 🧠
+- Thanks to **Gradio** for helping build the app interface. 💻
+- Thanks to **OpenAI** and other research groups for their work on AI and machine learning. 🌍
+
+
+Enjoy coding with **Superior Code Assistant**! Let the AI help you improve your coding skills and make your workflow smoother. 🚀
 
